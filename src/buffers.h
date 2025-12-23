@@ -42,6 +42,8 @@ void akvcam_buffers_set_count(akvcam_buffers_t self, size_t nbuffers);
 akvcam_frame_t akvcam_buffers_read_frame(akvcam_buffers_t self);
 int akvcam_buffers_write_frame(akvcam_buffers_t self, akvcam_frame_t frame);
 struct vb2_queue *akvcam_buffers_vb2_queue(akvcam_buffers_t self);
+void akvcam_buffers_set_last_frame_timestamp(akvcam_buffers_t self, u64 timestamp_ns);
+u64 akvcam_buffers_get_last_frame_timestamp(akvcam_buffers_t self);
 
 // signals
 akvcam_signal_no_args(buffers, streaming_started);

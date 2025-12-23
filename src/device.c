@@ -84,6 +84,9 @@ struct akvcam_device
     bool vertical_flip;
     AKVCAM_SCALING scaling;
     AKVCAM_ASPECT_RATIO aspect_ratio;
+    
+    // Timestamp from metadata (for passing from output to capture device)
+    u64 frame_timestamp_ns;
 };
 
 typedef int (*akvcam_thread_t)(void *data);
@@ -505,6 +508,12 @@ void akvcam_device_clock_run_once(akvcam_device_t self)
 
         adjusted_frame = akvcam_device_frame_apply_adjusts(self, frame);
         akvcam_frame_delete(frame);
+        
+        // 将时间戳传递到 buffers，用于 capture device 的 buffer
+        if (self->frame_timestamp_ns != 0) {
+            akvcam_buffers_set_last_frame_timestamp(self->buffers, self->frame_timestamp_ns);
+        }
+        
         result = akvcam_buffers_write_frame(self->buffers, adjusted_frame);
 
         if (result < 0) {
@@ -521,6 +530,9 @@ void akvcam_device_clock_run_once(akvcam_device_t self)
         akvcam_frame_t frame = akvcam_buffers_read_frame(self->buffers);
 
         if (frame) {
+            // 获取 buffer 的时间戳（如果从 metadata 解析的）
+            u64 frame_timestamp_ns = akvcam_buffers_get_last_frame_timestamp(self->buffers);
+            
             for (;;) {
                 akvcam_device_t capture_device =
                         akvcam_list_next(self->connected_devices, &it);
@@ -531,6 +543,8 @@ void akvcam_device_clock_run_once(akvcam_device_t self)
                 if (!mutex_lock_interruptible(&capture_device->frame_mutex)) {
                     akvcam_frame_delete(capture_device->current_frame);
                     capture_device->current_frame = akvcam_frame_new_copy(frame);
+                    // 传递时间戳到 capture device
+                    capture_device->frame_timestamp_ns = frame_timestamp_ns;
                     mutex_unlock(&capture_device->frame_mutex);
                 }
             }
