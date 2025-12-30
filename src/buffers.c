@@ -19,7 +19,6 @@
 #include <linux/kref.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
-#include <linux/uaccess.h>
 #include <media/v4l2-common.h>
 #include <media/videobuf2-vmalloc.h>
 
@@ -28,16 +27,12 @@
 #include "format.h"
 #include "frame.h"
 #include "log.h"
-#include "debug_control.h"
-
-#define META_SIZE 16  // metadata 大小：tv_sec (8) + tv_usec (8)
 
 #define AKVCAM_BUFFERS_MIN 2
 
 typedef struct {
     struct vb2_v4l2_buffer vb;
     struct list_head list;
-    u64 metadata_timestamp_ns;  // 从 metadata 解析的时间戳（纳秒），0 表示未设置
 } akvcam_buffers_buffer, *akvcam_buffers_buffer_t;
 
 static const struct vb2_ops akvcam_akvcam_buffers_queue_ops;
@@ -55,7 +50,13 @@ struct akvcam_buffers
     enum v4l2_buf_type type;
     AKVCAM_RW_MODE rw_mode;
     __u32 sequence;
-    u64 last_frame_timestamp_ns;  // 最后读取的 frame 的时间戳（用于传递到 capture device）
+    
+    /* Timestamp passthrough support */
+    bool has_pending_timestamp;
+    u64 pending_timestamp_sec;
+    u64 pending_timestamp_usec;
+    u64 last_used_timestamp_ns;  /* Track last used timestamp */
+    u64 frame_interval_ns;       /* Estimated frame interval */
 };
 
 akvcam_signal_define(buffers, streaming_started)
@@ -85,6 +86,11 @@ akvcam_buffers_t akvcam_buffers_new(AKVCAM_RW_MODE rw_mode,
     self->rw_mode = rw_mode;
     self->type = type;
     self->format = akvcam_format_new(0, 0, 0, NULL);
+    self->has_pending_timestamp = false;
+    self->pending_timestamp_sec = 0;
+    self->pending_timestamp_usec = 0;
+    self->last_used_timestamp_ns = 0;
+    self->frame_interval_ns = 33333333;  /* Default: ~30fps */
     self->queue.type = type;
     self->queue.io_modes =
             akvcam_buffers_io_modes_from_device_type(self->type,
@@ -170,28 +176,18 @@ akvcam_frame_t akvcam_buffers_read_frame(akvcam_buffers_t self)
     buf = list_entry(self->buffers.next, akvcam_buffers_buffer, list);
     list_del(&buf->list);
     
-    // 如果 buffer 有从 metadata 解析的时间戳，使用它；否则使用当前时间
-    if (buf->metadata_timestamp_ns != 0) {
-        buf->vb.vb2_buf.timestamp = buf->metadata_timestamp_ns;
-        // 设置时间戳标志
-        buf->vb.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-        buf->vb.flags &= ~V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    {
+        u64 buf_timestamp_ns = ktime_get_ns();
+        u64 monotonic_ns = buf_timestamp_ns;
         
-        // 保存时间戳到 buffers 结构，用于传递到 capture device
-        self->last_frame_timestamp_ns = buf->metadata_timestamp_ns;
+        buf->vb.vb2_buf.timestamp = buf_timestamp_ns;
+        buf->vb.field = V4L2_FIELD_NONE;
+        buf->vb.sequence = self->sequence++;
         
-        // 记录设置时间戳的日志
-        u64 timestamp_us = buf->metadata_timestamp_ns / 1000;
-        u64 now_ns = ktime_get_ns();
-        u64 now_us = now_ns / 1000;
-        log_point("AKVCAM set buffer timestamp", timestamp_us, now_us);
-    } else {
-        buf->vb.vb2_buf.timestamp = ktime_get_ns();
-        self->last_frame_timestamp_ns = 0;  // 清除保存的时间戳
+        trace_printk("[VB2][AKVCAM] OUTPUT_Read_Frame sys_timestamp=%llu monotonic_timestamp=%llu index=%d seq=%u\n",
+                     buf_timestamp_ns, monotonic_ns, buf->vb.vb2_buf.index, buf->vb.sequence);
     }
     
-    buf->vb.field = V4L2_FIELD_NONE;
-    buf->vb.sequence = self->sequence++;
     mutex_unlock(&self->frames_mutex);
 
     frame = akvcam_frame_new(self->format, NULL, 0);
@@ -214,10 +210,17 @@ int akvcam_buffers_write_frame(akvcam_buffers_t self, akvcam_frame_t frame)
     int result;
 
     akpr_function();
+    
     result = mutex_lock_interruptible(&self->frames_mutex);
 
     if (result)
         return result;
+
+    /* Trace AFTER mutex lock to see actual state */
+    trace_printk("[VB2][AKVCAM] CAPTURE_Write_Frame_Entry has_pending=%d sec=%llu usec=%llu\n",
+                 self->has_pending_timestamp, 
+                 self->pending_timestamp_sec, 
+                 self->pending_timestamp_usec);
 
     if (list_empty(&self->buffers)) {
         mutex_unlock(&self->frames_mutex);
@@ -228,24 +231,52 @@ int akvcam_buffers_write_frame(akvcam_buffers_t self, akvcam_frame_t frame)
     buf = list_entry(self->buffers.next, akvcam_buffers_buffer, list);
     list_del(&buf->list);
     
-    // 对于 capture device，从 device 的 frame_timestamp_ns 获取时间戳
-    // 这个时间戳是从 output device 传递过来的
-    // 注意：我们需要从 device 获取时间戳，但这里没有直接访问 device 的方式
-    // 所以我们需要通过其他方式传递时间戳
-    // 实际上，时间戳应该在 device 的 frame_timestamp_ns 中
-    // 但这里我们无法直接访问 device，所以暂时使用 buffer 的 metadata_timestamp_ns
-    // 或者使用保存的 last_frame_timestamp_ns
-    if (buf->metadata_timestamp_ns != 0) {
-        buf->vb.vb2_buf.timestamp = buf->metadata_timestamp_ns;
-        buf->vb.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-        buf->vb.flags &= ~V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-    } else if (self->last_frame_timestamp_ns != 0) {
-        // 使用保存的时间戳
-        buf->vb.vb2_buf.timestamp = self->last_frame_timestamp_ns;
-        buf->vb.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-        buf->vb.flags &= ~V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    /* Use pending timestamp if available (from ffmpeg via output device),
+     * otherwise use current time */
+    if (self->has_pending_timestamp) {
+        u64 sys_timestamp_ns, monotonic_ns;
+        
+        /* Convert sec/usec to nanoseconds for vb2_buffer timestamp */
+        sys_timestamp_ns = self->pending_timestamp_sec * 1000000000ULL +
+                          self->pending_timestamp_usec * 1000ULL;
+        
+        /* If this timestamp was already used, increment it by frame interval */
+        if (sys_timestamp_ns == self->last_used_timestamp_ns) {
+            // sys_timestamp_ns += self->frame_interval_ns;
+            sys_timestamp_ns=0;
+            trace_printk("[VB2][AKVCAM] CAPTURE_Incremented_Timestamp old=%llu new=%llu interval=%llu\n",
+                         self->last_used_timestamp_ns, sys_timestamp_ns, self->frame_interval_ns);
+        } else if (self->last_used_timestamp_ns > 0) {
+            /* Calculate actual frame interval from new timestamp */
+            if (sys_timestamp_ns > self->last_used_timestamp_ns) {
+                self->frame_interval_ns = sys_timestamp_ns - self->last_used_timestamp_ns;
+                trace_printk("[VB2][AKVCAM] CAPTURE_Updated_Interval new_interval=%llu\n",
+                             self->frame_interval_ns);
+            }
+        }
+        
+        buf->vb.vb2_buf.timestamp = sys_timestamp_ns;
+        self->last_used_timestamp_ns = sys_timestamp_ns;
+        
+        monotonic_ns = ktime_get_ns();
+        
+        trace_printk("[VB2][AKVCAM] CAPTURE_Write_Frame_With_Passthrough sys_timestamp=%llu monotonic_timestamp=%llu index=%d seq=%u\n",
+                     sys_timestamp_ns, monotonic_ns, buf->vb.vb2_buf.index, self->sequence);
+        
+        akpr_debug("CAPTURE write_frame: Using passthrough timestamp: sec=%llu, usec=%llu, ns=%llu\n",
+                   self->pending_timestamp_sec, self->pending_timestamp_usec,
+                   buf->vb.vb2_buf.timestamp);
+        
+        /* NOTE: Do NOT clear has_pending_timestamp here!
+         * Keep it until a new timestamp is set by the next write.
+         * This prevents race conditions and allows reuse if clock runs faster than writes.
+         */
     } else {
-        buf->vb.vb2_buf.timestamp = ktime_get_ns();
+        u64 monotonic_ns = ktime_get_ns();
+        buf->vb.vb2_buf.timestamp = monotonic_ns;
+        
+        trace_printk("[VB2][AKVCAM] CAPTURE_Write_Frame_Kernel_TS sys_timestamp=%llu monotonic_timestamp=%llu index=%d seq=%u\n",
+                     monotonic_ns, monotonic_ns, buf->vb.vb2_buf.index, self->sequence);
     }
     
     buf->vb.field = V4L2_FIELD_NONE;
@@ -259,6 +290,13 @@ int akvcam_buffers_write_frame(akvcam_buffers_t self, akvcam_frame_t frame)
     }
 
     vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+    
+    /* Trace when buffer is ready for DQBUF */
+    {
+        u64 monotonic_ns = ktime_get_ns();
+        trace_printk("[VB2][AKVCAM] CAPTURE_Buffer_Done_Ready_For_DQBUF sys_timestamp=%llu monotonic_timestamp=%llu index=%d seq=%u\n",
+                     buf->vb.vb2_buf.timestamp, monotonic_ns, buf->vb.vb2_buf.index, buf->vb.sequence);
+    }
 
     return 0;
 }
@@ -339,8 +377,6 @@ int akvcam_buffers_buffer_prepare(struct vb2_buffer *buffer)
         if (vb2_plane_size(buffer, i) < plane_size)
             return -EINVAL;
         else
-            // 注意：对于 WRITE 模式，payload 会在实际写入时设置
-            // 这里设置一个初始值，但实际写入的数据可能包含 metadata，所以会更大
             vb2_set_plane_payload(buffer, i, plane_size);
     }
 
@@ -355,118 +391,8 @@ void akvcam_buffers_buffer_queue(struct vb2_buffer *buffer)
     akvcam_buffers_t self = vb2_get_drv_priv(buffer->vb2_queue);
     struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(buffer);
     akvcam_buffers_buffer_t buf = container_of(vbuf, akvcam_buffers_buffer, vb);
-    u64 timestamp_ns = 0;
-    bool has_metadata = false;
 
     akpr_function();
-
-    // 初始化 metadata_timestamp_ns 为 0（表示未设置）
-    buf->metadata_timestamp_ns = 0;
-
-    // 对于 OUTPUT device，检查数据是否包含 metadata（最后16字节）
-    if (self->type == V4L2_BUF_TYPE_VIDEO_OUTPUT ||
-        self->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-        // 对于 WRITE 模式，vb2_fop_write 会将实际写入的字节数设置到 payload
-        // 但是，vb2_get_plane_payload 可能返回 buffer_prepare 中设置的值，而不是实际写入的值
-        // 我们需要检查 buffer->planes[0].bytesused 是否包含实际写入的字节数
-        size_t bytesused = vb2_get_plane_payload(buffer, 0);
-        size_t plane_size = vb2_plane_size(buffer, 0);
-        
-        // 检查 buffer->planes[0].bytesused 是否包含实际写入的字节数
-        // 对于 WRITE 模式，vb2_fop_write 会将实际写入的字节数设置到 planes[0].bytesused
-        // 注意：buffer->planes 是一个数组，不能检查是否为 NULL
-        if (buffer->planes[0].bytesused > 0) {
-            bytesused = buffer->planes[0].bytesused;
-            pr_info("AKVCAM: Using planes[0].bytesused=%zu (payload was %zu, plane_size=%zu)\n",
-                   bytesused, vb2_get_plane_payload(buffer, 0), plane_size);
-        } else {
-            pr_info("AKVCAM: buffer_queue - payload=%zu, plane_size=%zu, planes[0].bytesused=%u\n",
-                   bytesused, plane_size, buffer->planes[0].bytesused);
-        }
-        
-        // 对于未压缩格式，如果 FFmpeg 写入了 plane_size + 16（包含 metadata），
-        // bytesused 应该是 plane_size + 16
-        // 如果 bytesused == plane_size，metadata 在 plane_size 位置（即 plane_size 到 plane_size + 16）
-        
-        if (bytesused == 0) {
-            pr_info("AKVCAM: payload is 0, skipping metadata check\n");
-        } else if (bytesused >= META_SIZE) {
-            // 读取最后 16 字节的 metadata
-            char meta_buf[META_SIZE];
-            void *plane_vaddr = vb2_plane_vaddr(buffer, 0);
-
-            if (plane_vaddr) {
-                // 从数据末尾读取 metadata
-                // 如果 bytesused > plane_size，说明包含 metadata，从 bytesused - 16 位置读取
-                // 如果 bytesused == plane_size，对于未压缩格式，metadata 在 plane_size 位置
-                size_t metadata_offset;
-                
-                if (bytesused > plane_size) {
-                    // bytesused > plane_size，说明包含 metadata，从 bytesused - 16 位置读取
-                    metadata_offset = bytesused - META_SIZE;
-                } else if (bytesused == plane_size) {
-                    // bytesused == plane_size，对于未压缩格式，metadata 在 plane_size 位置
-                    // 假设 buffer 大小 >= plane_size + 16，从 plane_size 位置读取
-                    metadata_offset = plane_size;
-                } else {
-                    // bytesused < plane_size，说明是压缩格式，从 bytesused - 16 位置读取
-                    metadata_offset = bytesused - META_SIZE;
-                }
-                
-                // 检查 metadata_offset 是否有效（不能超出 buffer 大小）
-                if (metadata_offset + META_SIZE <= vb2_plane_size(buffer, 0)) {
-                    memcpy(meta_buf, (char *)plane_vaddr + metadata_offset, META_SIZE);
-
-                    // 调试：打印原始字节和读取位置
-                    pr_info("AKVCAM: Parsed metadata - raw bytes: "
-                           "%02x %02x %02x %02x %02x %02x %02x %02x | "
-                           "%02x %02x %02x %02x %02x %02x %02x %02x, "
-                           "bytesused=%zu, plane_size=%zu, metadata_offset=%zu\n",
-                           meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3],
-                           meta_buf[4], meta_buf[5], meta_buf[6], meta_buf[7],
-                           meta_buf[8], meta_buf[9], meta_buf[10], meta_buf[11],
-                           meta_buf[12], meta_buf[13], meta_buf[14], meta_buf[15],
-                           bytesused, plane_size, metadata_offset);
-
-                    // 解析大端序的 sec 和 usec（手动字节序转换）
-                    u64 user_sec = ((u64)meta_buf[0] << 56) | ((u64)meta_buf[1] << 48) |
-                                   ((u64)meta_buf[2] << 40) | ((u64)meta_buf[3] << 32) |
-                                   ((u64)meta_buf[4] << 24) | ((u64)meta_buf[5] << 16) |
-                                   ((u64)meta_buf[6] << 8)  | ((u64)meta_buf[7]);
-                    u64 user_usec = ((u64)meta_buf[8] << 56) | ((u64)meta_buf[9] << 48) |
-                                    ((u64)meta_buf[10] << 40) | ((u64)meta_buf[11] << 32) |
-                                    ((u64)meta_buf[12] << 24) | ((u64)meta_buf[13] << 16) |
-                                    ((u64)meta_buf[14] << 8)  | ((u64)meta_buf[15]);
-
-                    pr_info("AKVCAM: Parsed - user_sec=%llu, user_usec=%llu\n",
-                           user_sec, user_usec);
-
-                    // 转换为纳秒时间戳
-                    timestamp_ns = user_sec * 1000000000ULL + user_usec * 1000ULL;
-                    buf->metadata_timestamp_ns = timestamp_ns;
-                    has_metadata = true;
-
-                    // 记录解析时间戳的日志
-                    u64 timestamp_us = user_sec * 1000000ULL + user_usec;
-                    u64 now_ns = ktime_get_ns();
-                    u64 now_us = now_ns / 1000;
-                    log_point("AKVCAM parse timestamp", timestamp_us, now_us);
-
-                    // 调整 bytesused，移除 metadata 部分
-                    if (bytesused > META_SIZE) {
-                        vb2_set_plane_payload(buffer, 0, bytesused - META_SIZE);
-                    }
-                } else {
-                    pr_info("AKVCAM: metadata_offset + META_SIZE exceeds buffer size\n");
-                }
-            } else {
-                pr_info("AKVCAM: plane_vaddr is NULL, cannot read metadata\n");
-            }
-        } else {
-            pr_info("AKVCAM: No metadata found - bytesused=%zu, plane_size=%zu, META_SIZE=%d\n",
-                   bytesused, plane_size, META_SIZE);
-        }
-    }
 
     if (!mutex_lock_interruptible(&self->frames_mutex)) {
         list_add_tail(&buf->list, &self->buffers);
@@ -505,17 +431,6 @@ void akvcam_buffers_stop_streaming(struct vb2_queue *queue)
     }
 }
 
-void akvcam_buffers_set_last_frame_timestamp(akvcam_buffers_t self, u64 timestamp_ns)
-{
-    if (self)
-        self->last_frame_timestamp_ns = timestamp_ns;
-}
-
-u64 akvcam_buffers_get_last_frame_timestamp(akvcam_buffers_t self)
-{
-    return self ? self->last_frame_timestamp_ns : 0;
-}
-
 static const struct vb2_ops akvcam_akvcam_buffers_queue_ops = {
     .queue_setup     = akvcam_buffers_queue_setup,
     .buf_prepare     = akvcam_buffers_buffer_prepare,
@@ -525,3 +440,47 @@ static const struct vb2_ops akvcam_akvcam_buffers_queue_ops = {
     .wait_prepare    = vb2_ops_wait_prepare,
     .wait_finish     = vb2_ops_wait_finish,
 };
+
+/* Timestamp passthrough support functions */
+
+void akvcam_buffers_set_pending_timestamp(akvcam_buffers_t self, u64 sec, u64 usec)
+{
+    if (!self)
+        return;
+    
+    self->has_pending_timestamp = true;
+    self->pending_timestamp_sec = sec;
+    self->pending_timestamp_usec = usec;
+    
+    trace_printk("[VB2][AKVCAM] Buffers_Set_Pending_Timestamp sec=%llu usec=%llu has_pending=%d\n",
+                 sec, usec, self->has_pending_timestamp);
+    
+    akpr_debug("Set pending timestamp: sec=%llu, usec=%llu\n", sec, usec);
+}
+
+void akvcam_buffers_clear_pending_timestamp(akvcam_buffers_t self)
+{
+    if (!self)
+        return;
+    
+    trace_printk("[VB2][AKVCAM] Buffers_Clear_Pending_Timestamp was_pending=%d\n",
+                 self->has_pending_timestamp);
+    
+    self->has_pending_timestamp = false;
+    self->pending_timestamp_sec = 0;
+    self->pending_timestamp_usec = 0;
+}
+
+bool akvcam_buffers_has_pending_timestamp(akvcam_buffers_ct self)
+{
+    return self ? self->has_pending_timestamp : false;
+}
+
+void akvcam_buffers_get_pending_timestamp(akvcam_buffers_ct self, u64 *sec, u64 *usec)
+{
+    if (!self || !sec || !usec)
+        return;
+    
+    *sec = self->pending_timestamp_sec;
+    *usec = self->pending_timestamp_usec;
+}

@@ -45,6 +45,12 @@ struct vb2_queue *akvcam_buffers_vb2_queue(akvcam_buffers_t self);
 void akvcam_buffers_set_last_frame_timestamp(akvcam_buffers_t self, u64 timestamp_ns);
 u64 akvcam_buffers_get_last_frame_timestamp(akvcam_buffers_t self);
 
+// Timestamp passthrough support
+void akvcam_buffers_set_pending_timestamp(akvcam_buffers_t self, u64 sec, u64 usec);
+void akvcam_buffers_clear_pending_timestamp(akvcam_buffers_t self);
+bool akvcam_buffers_has_pending_timestamp(akvcam_buffers_ct self);
+void akvcam_buffers_get_pending_timestamp(akvcam_buffers_ct self, u64 *sec, u64 *usec);
+
 // signals
 akvcam_signal_no_args(buffers, streaming_started);
 akvcam_signal_no_args(buffers, streaming_stopped);

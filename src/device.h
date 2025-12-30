@@ -61,6 +61,12 @@ akvcam_devices_list_t akvcam_device_connected_devices_nr(akvcam_device_ct self);
 akvcam_devices_list_t akvcam_device_connected_devices(akvcam_device_ct self);
 __u32 akvcam_device_caps(akvcam_device_ct self);
 
+// Custom write function for timestamp passthrough
+ssize_t akvcam_device_write_with_timestamp(struct file *file,
+                                           const char __user *buf,
+                                           size_t count,
+                                           loff_t *ppos);
+
 // public static
 AKVCAM_DEVICE_TYPE akvcam_device_type_from_v4l2(enum v4l2_buf_type type);
 

@@ -254,6 +254,7 @@ struct akvcam_frame
     akvcam_format_t format;
     void *data;
     size_t size;
+    u64 timestamp_ns;
 };
 
 bool akvcam_frame_adjust_format_supported(__u32 fourcc);
@@ -295,6 +296,7 @@ akvcam_frame_t akvcam_frame_new_copy(akvcam_frame_ct other)
         if (self->data)
             memcpy(self->data, other->data, self->size);
     }
+    self->timestamp_ns = other->timestamp_ns;
 
     return self;
 }

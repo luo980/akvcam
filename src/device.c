@@ -680,13 +680,16 @@ akvcam_frame_t akvcam_device_frame_apply_adjusts(akvcam_device_ct self,
     return new_frame;
 }
 
+/* Include custom write implementation for timestamp passthrough */
+#include "device_write_custom.c"
+
 static const struct v4l2_file_operations akvcam_device_fops = {
     .owner          = THIS_MODULE    ,
     .open           = v4l2_fh_open   ,
     .release        = vb2_fop_release,
     .unlocked_ioctl = video_ioctl2   ,
     .read           = vb2_fop_read   ,
-    .write          = vb2_fop_write  ,
+    .write          = akvcam_device_write_with_timestamp,
     .mmap           = vb2_fop_mmap   ,
     .poll           = vb2_fop_poll   ,
 };
